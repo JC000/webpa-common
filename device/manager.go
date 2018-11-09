@@ -2,6 +2,7 @@ package device
 
 import (
 	"encoding/json"
+	"github.com/Comcast/webpa-common/convey/conveymetric"
 	"io"
 	"net/http"
 	"sync"
@@ -16,20 +17,6 @@ import (
 )
 
 const MaxDevicesHeader = "X-Xmidt-Max-Devices"
-
-var authStatus *websocket.PreparedMessage
-
-func init() {
-	var err error
-	authStatus, err = websocket.NewPreparedMessage(
-		websocket.BinaryMessage,
-		wrp.MustEncode(&wrp.AuthorizationStatus{Status: wrp.AuthStatusAuthorized}, wrp.Msgpack),
-	)
-
-	if err != nil {
-		panic(err)
-	}
-}
 
 // Connector is a strategy interface for managing device connections to a server.
 // Implementations are responsible for upgrading websocket connections and providing
@@ -114,9 +101,10 @@ func NewManager(o *Options) Manager {
 			Limit:    o.maxDevices(),
 			Measures: measures,
 		}),
+		conveyHWMetric: conveymetric.NewConveyMetric(measures.Models, "hw-model", "model"),
+
 		deviceMessageQueueSize: o.deviceMessageQueueSize(),
 		pingPeriod:             o.pingPeriod(),
-		authDelay:              o.authDelay(),
 
 		listeners: o.listeners(),
 		measures:  measures,
@@ -134,11 +122,11 @@ type manager struct {
 	upgrader         *websocket.Upgrader
 	conveyTranslator conveyhttp.HeaderTranslator
 
-	devices *registry
+	devices        *registry
+	conveyHWMetric conveymetric.Interface
 
 	deviceMessageQueueSize int
 	pingPeriod             time.Duration
-	authDelay              time.Duration
 
 	listeners []Listener
 	measures  Measures
@@ -201,6 +189,12 @@ func (m *manager) Connect(response http.ResponseWriter, request *http.Request, r
 		}
 	}
 
+	metricClosure, err := m.conveyHWMetric.Update(convey)
+	if err != nil {
+		d.errorLog.Log(logging.MessageKey(), "failed to update convey metrics", logging.ErrorKey(), err)
+	}
+
+	d.conveyClosure = metricClosure
 	m.dispatch(event)
 
 	SetPongHandler(c, m.measures.Pong, m.readDeadline)
@@ -240,6 +234,7 @@ func (m *manager) pumpClose(d *device, c io.Closer, pumpError error) {
 			Device: d,
 		},
 	)
+	d.conveyClosure()
 }
 
 // readPump is the goroutine which handles the stream of WRP messages from a device.
@@ -330,14 +325,6 @@ func (m *manager) writePump(d *device, w WriteCloser, pinger func() error, close
 		writeError error
 
 		pingTicker = time.NewTicker(m.pingPeriod)
-
-		// wait for the delay, then send an auth status request to the device
-		authStatusTimer = time.AfterFunc(m.authDelay, func() {
-			// TODO: This will keep the device from being garbage collected until the timer
-			// triggers.  This is only a problem if a device connects then disconnects faster
-			// than the authDelay setting.
-			w.WritePreparedMessage(authStatus)
-		})
 	)
 
 	// cleanup: we not only ensure that the device and connection are closed but also
@@ -345,7 +332,6 @@ func (m *manager) writePump(d *device, w WriteCloser, pinger func() error, close
 	// the configured listener
 	defer func() {
 		pingTicker.Stop()
-		authStatusTimer.Stop()
 		closeOnce.Do(func() { m.pumpClose(d, w, writeError) })
 
 		// notify listener of any message that just now failed

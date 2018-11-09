@@ -22,23 +22,31 @@ func TestListenAndServeNonSecure(t *testing.T) {
 		testData    = []struct {
 			certificateFile, keyFile string
 			expectedError            error
+			shouldCallFinal          bool
 		}{
-			{"", "", nil},
-			{"", "", simpleError},
-			{"file.cert", "", nil},
-			{"file.cert", "", simpleError},
-			{"", "file.key", nil},
-			{"", "file.key", simpleError},
+			{"", "", http.ErrServerClosed, true},
+			{"", "", simpleError, false},
+			{"file.cert", "", http.ErrServerClosed, true},
+			{"file.cert", "", simpleError, false},
+			{"", "file.key", http.ErrServerClosed, true},
+			{"", "file.key", simpleError, false},
 		}
 	)
 
 	for _, record := range testData {
 		t.Logf("%#v", record)
 		var (
+			assert = assert.New(t)
+
 			_, logger      = newTestLogger()
-			executorCalled = make(chan struct{})
+			executorCalled = make(chan struct{}, 1)
 			mockSecure     = new(mockSecure)
 			mockExecutor   = new(mockExecutor)
+
+			finalizerCalled = make(chan struct{})
+			finalizer       = func() {
+				close(finalizerCalled)
+			}
 		)
 
 		mockSecure.On("Certificate").
@@ -47,11 +55,24 @@ func TestListenAndServeNonSecure(t *testing.T) {
 
 		mockExecutor.On("ListenAndServe").
 			Return(record.expectedError).
-			Run(func(mock.Arguments) { close(executorCalled) }).
-			Once()
+			Run(func(mock.Arguments) { executorCalled <- struct{}{} })
 
-		ListenAndServe(logger, mockSecure, mockExecutor)
-		<-executorCalled
+		ListenAndServe(logger, mockSecure, mockExecutor, finalizer)
+		select {
+		case <-executorCalled:
+			// passing
+		case <-time.After(time.Second):
+			assert.Fail("the executor was not called")
+		}
+
+		select {
+		case <-finalizerCalled:
+			// passing
+		case <-time.After(time.Second):
+			if record.shouldCallFinal {
+				assert.Fail("the finalizer was not called")
+			}
+		}
 
 		mockSecure.AssertExpectations(t)
 		mockExecutor.AssertExpectations(t)
@@ -61,20 +82,28 @@ func TestListenAndServeNonSecure(t *testing.T) {
 func TestListenAndServeSecure(t *testing.T) {
 	var (
 		testData = []struct {
-			expectedError error
+			expectedError   error
+			shouldCallFinal bool
 		}{
-			{nil},
-			{errors.New("expected")},
+			{http.ErrServerClosed, true},
+			{errors.New("expected"), false},
 		}
 	)
 
 	for _, record := range testData {
 		t.Logf("%#v", record)
 		var (
+			assert = assert.New(t)
+
 			_, logger      = newTestLogger()
-			executorCalled = make(chan struct{})
+			executorCalled = make(chan struct{}, 1)
 			mockSecure     = new(mockSecure)
 			mockExecutor   = new(mockExecutor)
+
+			finalizerCalled = make(chan struct{})
+			finalizer       = func() {
+				close(finalizerCalled)
+			}
 		)
 
 		mockSecure.On("Certificate").
@@ -83,11 +112,24 @@ func TestListenAndServeSecure(t *testing.T) {
 
 		mockExecutor.On("ListenAndServeTLS", "file.cert", "file.key").
 			Return(record.expectedError).
-			Run(func(mock.Arguments) { close(executorCalled) }).
-			Once()
+			Run(func(mock.Arguments) { executorCalled <- struct{}{} })
 
-		ListenAndServe(logger, mockSecure, mockExecutor)
-		<-executorCalled
+		ListenAndServe(logger, mockSecure, mockExecutor, finalizer)
+		select {
+		case <-executorCalled:
+			// passing
+		case <-time.After(time.Second):
+			assert.Fail("the executor was not called")
+		}
+
+		select {
+		case <-finalizerCalled:
+			// passing
+		case <-time.After(time.Second):
+			if record.shouldCallFinal {
+				assert.Fail("the finalizer was not called")
+			}
+		}
 
 		mockSecure.AssertExpectations(t)
 		mockExecutor.AssertExpectations(t)
@@ -297,12 +339,13 @@ func TestWebPANoPrimaryAddress(t *testing.T) {
 		handler = new(mockHandler)
 		webPA   = WebPA{}
 
-		_, logger         = newTestLogger()
-		monitor, runnable = webPA.Prepare(logger, nil, xmetrics.MustNewRegistry(nil), handler)
+		_, logger               = newTestLogger()
+		monitor, runnable, done = webPA.Prepare(logger, nil, xmetrics.MustNewRegistry(nil), handler)
 	)
 
 	assert.Nil(monitor)
 	require.NotNil(runnable)
+	assert.NotNil(done)
 
 	var (
 		waitGroup = new(sync.WaitGroup)
@@ -355,12 +398,13 @@ func TestWebPA(t *testing.T) {
 			},
 		}
 
-		_, logger         = newTestLogger()
-		monitor, runnable = webPA.Prepare(logger, nil, xmetrics.MustNewRegistry(nil), handler)
+		_, logger               = newTestLogger()
+		monitor, runnable, done = webPA.Prepare(logger, nil, xmetrics.MustNewRegistry(nil), handler)
 	)
 
 	assert.NotNil(monitor)
 	require.NotNil(runnable)
+	assert.NotNil(done)
 
 	var (
 		waitGroup = new(sync.WaitGroup)
